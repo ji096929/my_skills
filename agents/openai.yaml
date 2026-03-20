@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release Firmware NV"
+  short_description: "Build, commit, tag, and push firmware-nv images"
+  default_prompt: "Use $release-firmware-nv to publish a new firmware-nv image tag from the current repo and container."
