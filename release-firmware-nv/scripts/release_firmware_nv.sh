@@ -205,9 +205,14 @@ ensure_tag_state() {
 find_previous_tag() {
   local target_norm="$1"
   local prefix=""
+  local raw_prefix=""
   local found=1
   local tag norm
   local -a lines=()
+
+  if [[ "$TARGET_TAG" =~ ^(.*)v[0-9].*$ ]]; then
+    raw_prefix="${BASH_REMATCH[1]}"
+  fi
 
   if [[ "$target_norm" =~ ^(.*[^0-9])([0-9]+)$ ]]; then
     prefix="${BASH_REMATCH[1]}"
@@ -215,6 +220,9 @@ find_previous_tag() {
 
   while IFS= read -r tag; do
     [[ "$tag" == "$TARGET_TAG" ]] && continue
+    if [[ -n "$raw_prefix" && "$tag" != "$raw_prefix"* ]]; then
+      continue
+    fi
     norm="$(normalize_tag "$tag")"
     if [[ -n "$prefix" ]]; then
       [[ "$norm" == "$prefix"* ]] || continue
