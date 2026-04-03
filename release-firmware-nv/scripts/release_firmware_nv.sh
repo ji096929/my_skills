@@ -390,6 +390,9 @@ find scripts -maxdepth 2 -type f \( -name "*.sh" -o -name "*.so" -o -name "__ini
 if [ -d wifi_provisioning ]; then
   find wifi_provisioning -type f ! -path "*/__pycache__/*" ! -name "setup.py" | sort
 fi
+if [ -d systemd ]; then
+  find systemd -type f | sort
+fi
 find vendor/human_case_sdk -maxdepth 3 -type f \( -name "*.so" -o -name "__init__.py" -o -name "main.py" \) | sort
 '
   )
@@ -404,6 +407,13 @@ find vendor/human_case_sdk -maxdepth 3 -type f \( -name "*.so" -o -name "__init_
     find "$STAGE_APP_ROOT/wifi_provisioning" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
     rm -f "$STAGE_APP_ROOT/wifi_provisioning/setup.py"
     record_artifact "wifi_provisioning"
+  fi
+
+  if [[ -d "$REPO_PATH/systemd" ]]; then
+    rm -rf "$STAGE_APP_ROOT/systemd"
+    cp -r "$REPO_PATH/systemd" "$STAGE_APP_ROOT/systemd"
+    record_action "sync systemd tree"
+    record_artifact "systemd"
   fi
 }
 
@@ -474,6 +484,9 @@ remove_runtime_for_deleted_path() {
       ;;
     wifi_provisioning/*)
       rm -rf "$STAGE_APP_ROOT/wifi_provisioning"
+      ;;
+    systemd/*)
+      rm -rf "$STAGE_APP_ROOT/systemd"
       ;;
     displayd/*)
       rm -rf "$STAGE_APP_ROOT/displayd"
@@ -610,6 +623,7 @@ apply_changed_paths() {
   local need_full_vendor_rebuild=0
   local need_full_wifi_tree_sync=0
   local need_wifi_module_recompile=0
+  local need_systemd_tree_sync=0
 
   for rel in "${CHANGED_FILES[@]}"; do
     if [[ "$rel" =~ ^scripts/tools/[^/]+\.py$ ]]; then
@@ -710,6 +724,9 @@ apply_changed_paths() {
       wifi_provisioning/*)
         need_full_wifi_tree_sync=1
         ;;
+      systemd/*)
+        need_systemd_tree_sync=1
+        ;;
     esac
   done
 
@@ -721,6 +738,14 @@ apply_changed_paths() {
     find "$STAGE_APP_ROOT/wifi_provisioning" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
     record_action "sync wifi_provisioning tree"
     record_artifact "wifi_provisioning"
+  fi
+
+  if [[ "$need_systemd_tree_sync" -eq 1 && -d "$REPO_PATH/systemd" ]]; then
+    rm -rf "$STAGE_APP_ROOT/systemd"
+    mkdir -p "$STAGE_APP_ROOT"
+    cp -r "$REPO_PATH/systemd" "$STAGE_APP_ROOT/systemd"
+    record_action "sync systemd tree"
+    record_artifact "systemd"
   fi
 
   if [[ "$need_capture_build" -eq 1 ]]; then
