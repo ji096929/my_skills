@@ -32,6 +32,7 @@ Options:
   --service <name>           Host systemd service used for regression
                              (default: glzn-all-services.service)
   --base-image <image>       Override the base image used for prepare
+  --previous-tag <tag>       Override the previous tag used for changed-file diff
   --allow-dirty              Allow prepare from a dirty worktree
   --allow-tag-off-head       Allow prepare when --tag does not point at HEAD
   --delete-existing-tag      Delete existing Harbor tag before push
@@ -62,6 +63,7 @@ DELETE_EXISTING_TAG=0
 HARBOR_USER="${HARBOR_USER:-}"
 HARBOR_PASSWORD="${HARBOR_PASSWORD:-}"
 BASE_IMAGE_OVERRIDE=""
+PREV_TAG_OVERRIDE=""
 
 STATE_ROOT_REL=".release/firmware-nv"
 STATE_ROOT=""
@@ -203,6 +205,13 @@ ensure_tag_state() {
 }
 
 find_previous_tag() {
+  if [[ -n "$PREV_TAG_OVERRIDE" ]]; then
+    git -C "$REPO_PATH" rev-parse --verify "$PREV_TAG_OVERRIDE^{commit}" >/dev/null 2>&1 || \
+      fail "previous tag not found: $PREV_TAG_OVERRIDE"
+    PREV_TAG_RAW="$PREV_TAG_OVERRIDE"
+    return 0
+  fi
+
   local target_norm="$1"
   local prefix=""
   local raw_prefix=""
@@ -509,6 +518,7 @@ ensure_cython() {
 
 compile_python_module_to_stage() {
   local rel="$1"
+  local no_record="${2:-0}"
   local abs="$REPO_PATH/$rel"
   local module_dir module_base module_name tmp_dir so_file stage_dir
 
@@ -519,7 +529,6 @@ compile_python_module_to_stage() {
   module_base="$(basename "$rel")"
   module_name="${module_base%.py}"
   tmp_dir="$(mktemp -d /tmp/release_nv_cython_XXXXXX)"
-  TMP_DIRS+=("$tmp_dir")
   cp "$abs" "$tmp_dir/$module_base"
 
   log "cythonizing $rel"
@@ -535,8 +544,57 @@ compile_python_module_to_stage() {
   mkdir -p "$stage_dir"
   find "$stage_dir" -maxdepth 1 -name "${module_name}.cpython-*.so" -delete 2>/dev/null || true
   cp "$so_file" "$stage_dir/"
-  record_action "cythonize $rel"
-  record_artifact "$module_dir/$(basename "$so_file")"
+  rm -rf "$tmp_dir"
+  if [[ "$no_record" != "1" ]]; then
+    record_action "cythonize $rel"
+    record_artifact "$module_dir/$(basename "$so_file")"
+  fi
+}
+
+parallel_compile_python_modules() {
+  local max_jobs pid rel module_dir module_base module_name so_path
+  local -a modules=("$@")
+  local -a pids=()
+  local -a running_modules=()
+  local fail_count=0
+
+  [[ "${#modules[@]}" -gt 0 ]] || return 0
+  ensure_cython
+  max_jobs="$(nproc 2>/dev/null || echo 1)"
+  [[ "$max_jobs" -ge 1 ]] || max_jobs=1
+
+  for rel in "${modules[@]}"; do
+    compile_python_module_to_stage "$rel" 1 &
+    pids+=("$!")
+    running_modules+=("$rel")
+
+    if [[ "${#pids[@]}" -ge "$max_jobs" ]]; then
+      for pid in "${pids[@]}"; do
+        if ! wait "$pid"; then
+          fail_count=$((fail_count + 1))
+        fi
+      done
+      pids=()
+    fi
+  done
+
+  for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+      fail_count=$((fail_count + 1))
+    fi
+  done
+
+  [[ "$fail_count" -eq 0 ]] || fail "parallel cythonize failed for ${fail_count} module(s)"
+
+  for rel in "${modules[@]}"; do
+    module_dir="$(dirname "$rel")"
+    module_base="$(basename "$rel")"
+    module_name="${module_base%.py}"
+    so_path="$(find "$STAGE_APP_ROOT/$module_dir" -maxdepth 1 -type f -name "${module_name}.cpython-*.so" | head -n1)"
+    [[ -n "$so_path" ]] || fail "compiled stage artifact not found for $rel"
+    record_action "cythonize $rel"
+    record_artifact "$module_dir/$(basename "$so_path")"
+  done
 }
 
 copy_repo_file_to_stage() {
@@ -578,32 +636,26 @@ build_displayd() {
 }
 
 rebuild_all_scripts_modules() {
-  local rel
-  while IFS= read -r rel; do
-    [[ -n "$rel" ]] || continue
-    compile_python_module_to_stage "$rel"
-  done < <(find "$REPO_PATH/scripts" -maxdepth 1 -type f -name '*.py' ! -name '__init__.py' ! -name 'auto_capture_pico_main.py' ! -name 'setup.py' -printf 'scripts/%f\n' | sort)
+  local -a modules=()
+  mapfile -t modules < <(find "$REPO_PATH/scripts" -maxdepth 1 -type f -name '*.py' ! -name '__init__.py' ! -name 'auto_capture_pico_main.py' ! -name 'setup.py' -printf 'scripts/%f\n' | sort)
+  parallel_compile_python_modules "${modules[@]}"
 }
 
 rebuild_vendor_modules() {
-  local rel
-  while IFS= read -r rel; do
-    [[ -n "$rel" ]] || continue
-    compile_python_module_to_stage "$rel"
-  done < <(find "$REPO_PATH/vendor/human_case_sdk" -maxdepth 1 -type f -name '*.py' ! -name '__init__.py' ! -name 'main.py' ! -name 'setup.py' -printf 'vendor/human_case_sdk/%f\n' | sort)
-
-  while IFS= read -r rel; do
-    [[ -n "$rel" ]] || continue
-    compile_python_module_to_stage "$rel"
-  done < <(find "$REPO_PATH/vendor/human_case_sdk/clients" -maxdepth 1 -type f -name '*.py' ! -name '__init__.py' ! -name 'setup.py' -printf 'vendor/human_case_sdk/clients/%f\n' | sort)
+  local -a modules=()
+  mapfile -t modules < <(
+    {
+      find "$REPO_PATH/vendor/human_case_sdk" -maxdepth 1 -type f -name '*.py' ! -name '__init__.py' ! -name 'main.py' ! -name 'setup.py' -printf 'vendor/human_case_sdk/%f\n'
+      find "$REPO_PATH/vendor/human_case_sdk/clients" -maxdepth 1 -type f -name '*.py' ! -name '__init__.py' ! -name 'setup.py' -printf 'vendor/human_case_sdk/clients/%f\n'
+    } | sort
+  )
+  parallel_compile_python_modules "${modules[@]}"
 }
 
 rebuild_wifi_provisioning_modules() {
-  local rel
-  while IFS= read -r rel; do
-    [[ -n "$rel" ]] || continue
-    compile_python_module_to_stage "$rel"
-  done < <(find "$REPO_PATH/wifi_provisioning" -maxdepth 1 -type f -name '*.py' ! -name '__init__.py' ! -name 'unified_server_main.py' ! -name 'setup.py' -printf 'wifi_provisioning/%f\n' | sort)
+  local -a modules=()
+  mapfile -t modules < <(find "$REPO_PATH/wifi_provisioning" -maxdepth 1 -type f -name '*.py' ! -name '__init__.py' ! -name 'unified_server_main.py' ! -name 'setup.py' -printf 'wifi_provisioning/%f\n' | sort)
+  parallel_compile_python_modules "${modules[@]}"
 }
 
 apply_deleted_paths() {
@@ -624,10 +676,11 @@ apply_changed_paths() {
   local need_full_wifi_tree_sync=0
   local need_wifi_module_recompile=0
   local need_systemd_tree_sync=0
+  local -a changed_python_modules=()
 
   for rel in "${CHANGED_FILES[@]}"; do
     if [[ "$rel" =~ ^scripts/tools/[^/]+\.py$ ]]; then
-      compile_python_module_to_stage "$rel"
+      changed_python_modules+=("$rel")
       continue
     fi
 
@@ -641,7 +694,7 @@ apply_changed_paths() {
           need_full_scripts_rebuild=1
           ;;
         *)
-          compile_python_module_to_stage "$rel"
+          changed_python_modules+=("$rel")
           ;;
       esac
       continue
@@ -658,7 +711,7 @@ apply_changed_paths() {
           need_wifi_module_recompile=1
           ;;
         *)
-          compile_python_module_to_stage "$rel"
+          changed_python_modules+=("$rel")
           need_wifi_module_recompile=1
           ;;
       esac
@@ -676,7 +729,7 @@ apply_changed_paths() {
           need_full_vendor_rebuild=1
           ;;
         *)
-          compile_python_module_to_stage "$rel"
+          changed_python_modules+=("$rel")
           ;;
       esac
       continue
@@ -692,7 +745,7 @@ apply_changed_paths() {
           need_full_vendor_rebuild=1
           ;;
         *)
-          compile_python_module_to_stage "$rel"
+          changed_python_modules+=("$rel")
           ;;
       esac
       continue
@@ -729,6 +782,10 @@ apply_changed_paths() {
         ;;
     esac
   done
+
+  if [[ "${#changed_python_modules[@]}" -gt 0 ]]; then
+    parallel_compile_python_modules "${changed_python_modules[@]}"
+  fi
 
   if [[ "$need_full_wifi_tree_sync" -eq 1 ]]; then
     rm -rf "$STAGE_APP_ROOT/wifi_provisioning"
@@ -1281,6 +1338,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --base-image)
       BASE_IMAGE_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --previous-tag)
+      PREV_TAG_OVERRIDE="${2:-}"
       shift 2
       ;;
     --allow-dirty)
