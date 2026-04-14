@@ -261,6 +261,8 @@ Example:
 - **Too strong**: `We propose a two-stage progressive-resolution training strategy that improves localization quality.`
 - **Usually correct**: `The detector was trained first at 640 resolution and then continued at 800 resolution, which improved localization quality on this dataset.`
 
+For concrete regression cases that should be caught by this check, see [references/regression-cases.md](references/regression-cases.md).
+
 ---
 
 ## Paper Structure Workflow
